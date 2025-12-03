@@ -1,0 +1,11 @@
+# Large data files
+data/raw/*.csv
+data/raw/*.zip
+data/streaming-input/
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+.DS_Store
