@@ -2,7 +2,8 @@
 data/raw/*.csv
 data/raw/*.zip
 data/streaming-input/
-
+.env
+.venv
 # Python
 __pycache__/
 *.pyc
