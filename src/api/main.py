@@ -14,6 +14,15 @@ import json
 import os
 import boto3
 from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID', '')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', '')
+AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
+KINESIS_STREAM = os.getenv('KINESIS_STREAM_NAME', 'nfl-play-stream')
 
 app = FastAPI(
     title="NFL Real-Time Analytics API",
@@ -32,9 +41,13 @@ app.add_middleware(
 
 # Load models on startup
 models = {}
+kinesis_client = None
 
 @app.on_event("startup")
-async def load_models():
+async def startup():
+    global kinesis_client
+    
+    # Load ML models
     base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         models['play_classifier'] = joblib.load(os.path.join(base_path, "models", "play_classifier.joblib"))
@@ -42,6 +55,21 @@ async def load_models():
         print("✅ Models loaded successfully")
     except Exception as e:
         print(f"❌ Error loading models: {e}")
+    
+    # Initialize Kinesis client
+    if AWS_ACCESS_KEY and AWS_SECRET_KEY:
+        try:
+            kinesis_client = boto3.client(
+                'kinesis',
+                region_name=AWS_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY,
+                aws_secret_access_key=AWS_SECRET_KEY
+            )
+            print(f"✅ Kinesis client initialized for stream: {KINESIS_STREAM}")
+        except Exception as e:
+            print(f"❌ Error initializing Kinesis: {e}")
+    else:
+        print("⚠️ AWS credentials not found in .env file")
 
 # Request/Response models
 class PlayData(BaseModel):
@@ -60,12 +88,6 @@ class PlayData(BaseModel):
     n_te: int = 1
     n_wr: int = 3
 
-class KinesisConfig(BaseModel):
-    aws_access_key: str
-    aws_secret_key: str
-    stream_name: str = "nfl-play-stream"
-    region: str = "us-east-1"
-
 class PredictionResponse(BaseModel):
     predicted_play: str
     run_probability: float
@@ -73,10 +95,10 @@ class PredictionResponse(BaseModel):
     pressure_probability: float
     risk_level: str
 
-class KinesisResponse(BaseModel):
-    status: str
-    records: List[dict]
-    predictions: List[dict]
+class KinesisRecord(BaseModel):
+    play_data: dict
+    prediction: dict
+    timestamp: str
 
 def calculate_features(play_data: PlayData) -> dict:
     """Calculate all features needed for prediction"""
@@ -170,7 +192,9 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "models_loaded": bool(models.get('play_classifier') and models.get('pressure_predictor'))
+        "models_loaded": bool(models.get('play_classifier') and models.get('pressure_predictor')),
+        "kinesis_configured": kinesis_client is not None,
+        "stream_name": KINESIS_STREAM
     }
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -180,46 +204,34 @@ async def predict(play_data: PlayData):
     prediction = get_prediction(features)
     return prediction
 
-@app.post("/kinesis/connect")
-async def kinesis_connect(config: KinesisConfig):
-    """Test Kinesis connection and list available shards"""
+@app.get("/kinesis/status")
+async def kinesis_status():
+    """Check Kinesis connection status"""
+    if not kinesis_client:
+        return {"status": "not_configured", "message": "AWS credentials not found in .env"}
+    
     try:
-        client = boto3.client(
-            'kinesis',
-            region_name=config.region,
-            aws_access_key_id=config.aws_access_key,
-            aws_secret_access_key=config.aws_secret_key
-        )
-        
-        # Describe stream to get shard info
-        response = client.describe_stream(StreamName=config.stream_name)
+        response = kinesis_client.describe_stream(StreamName=KINESIS_STREAM)
         shards = response['StreamDescription']['Shards']
-        
         return {
             "status": "connected",
-            "stream_name": config.stream_name,
+            "stream_name": KINESIS_STREAM,
             "stream_status": response['StreamDescription']['StreamStatus'],
-            "shards": [s['ShardId'] for s in shards],
-            "shard_count": len(shards)
+            "shard_count": len(shards),
+            "shards": [s['ShardId'] for s in shards]
         }
     except ClientError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "error", "message": str(e)}
 
-@app.post("/kinesis/fetch", response_model=KinesisResponse)
-async def kinesis_fetch(config: KinesisConfig):
-    """Fetch latest records from Kinesis and return predictions"""
+@app.get("/kinesis/fetch")
+async def kinesis_fetch(limit: int = 10):
+    """Fetch latest records from Kinesis stream"""
+    if not kinesis_client:
+        raise HTTPException(status_code=400, detail="Kinesis not configured. Add AWS credentials to .env")
+    
     try:
-        client = boto3.client(
-            'kinesis',
-            region_name=config.region,
-            aws_access_key_id=config.aws_access_key,
-            aws_secret_access_key=config.aws_secret_key
-        )
-        
         # Get shard list
-        stream_info = client.describe_stream(StreamName=config.stream_name)
+        stream_info = kinesis_client.describe_stream(StreamName=KINESIS_STREAM)
         shards = stream_info['StreamDescription']['Shards']
         
         if not shards:
@@ -227,14 +239,14 @@ async def kinesis_fetch(config: KinesisConfig):
         
         # Get iterator for first shard
         shard_id = shards[0]['ShardId']
-        shard_iterator = client.get_shard_iterator(
-            StreamName=config.stream_name,
+        shard_iterator = kinesis_client.get_shard_iterator(
+            StreamName=KINESIS_STREAM,
             ShardId=shard_id,
             ShardIteratorType='LATEST'
         )['ShardIterator']
         
         # Fetch records
-        response = client.get_records(ShardIterator=shard_iterator, Limit=10)
+        response = kinesis_client.get_records(ShardIterator=shard_iterator, Limit=limit)
         
         records = []
         predictions = []
@@ -264,30 +276,25 @@ async def kinesis_fetch(config: KinesisConfig):
         
         return {
             "status": "success",
+            "record_count": len(records),
             "records": records,
             "predictions": predictions
         }
         
     except ClientError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/kinesis/stream")
-async def kinesis_stream_records(config: KinesisConfig, records: List[dict]):
-    """Push records to Kinesis stream (for testing)"""
+@app.post("/kinesis/send")
+async def kinesis_send(records: List[dict]):
+    """Send records to Kinesis stream (for testing)"""
+    if not kinesis_client:
+        raise HTTPException(status_code=400, detail="Kinesis not configured")
+    
     try:
-        client = boto3.client(
-            'kinesis',
-            region_name=config.region,
-            aws_access_key_id=config.aws_access_key,
-            aws_secret_access_key=config.aws_secret_key
-        )
-        
         responses = []
         for record in records:
-            response = client.put_record(
-                StreamName=config.stream_name,
+            response = kinesis_client.put_record(
+                StreamName=KINESIS_STREAM,
                 Data=json.dumps(record).encode('utf-8'),
                 PartitionKey='play'
             )
@@ -297,8 +304,6 @@ async def kinesis_stream_records(config: KinesisConfig, records: List[dict]):
         
     except ClientError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
