@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+data/
+*.csv
+.DS_Store
+README.md
+docs/
