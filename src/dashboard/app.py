@@ -64,38 +64,25 @@ def fetch_kinesis_records():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-def display_prediction(prediction, play_data=None):
+def display_prediction(prediction, play_data=None, nested=False):
     """Display prediction results"""
-    col1, col2 = st.columns(2)
-    
     play_labels = {
         'inside_run': '🟤 Inside Run', 'outside_run': '🟠 Outside Run',
         'screen': '🟡 Screen Pass', 'short_pass': '🔵 Short Pass', 'deep_pass': '🟣 Deep Pass'
     }
     
-    with col1:
-        st.subheader("🎯 Play Type Prediction")
-        predicted = prediction.get('predicted_play', 'unknown')
-        st.metric("Predicted Play", play_labels.get(predicted, predicted))
-        
-        st.markdown("**Run vs Pass:**")
-        col_r, col_p = st.columns(2)
-        with col_r:
-            run_prob = prediction.get('run_probability', 0)
-            st.progress(float(run_prob))
-            st.caption(f"Run: {run_prob*100:.1f}%")
-        with col_p:
-            pass_prob = prediction.get('pass_probability', 0)
-            st.progress(float(pass_prob))
-            st.caption(f"Pass: {pass_prob*100:.1f}%")
+    predicted = prediction.get('predicted_play', 'unknown')
+    run_prob = prediction.get('run_probability', 0)
+    pass_prob = prediction.get('pass_probability', 0)
+    pressure_prob = prediction.get('pressure_probability', 0)
+    risk = prediction.get('risk_level', 'medium')
     
-    with col2:
-        st.subheader("💥 Pressure Prediction")
-        pressure_prob = prediction.get('pressure_probability', 0)
-        st.metric("Pressure Probability", f"{pressure_prob*100:.1f}%")
-        st.progress(float(pressure_prob))
+    if nested:
+        # Simple display for nested contexts (inside expanders)
+        st.markdown(f"**🎯 Predicted Play:** {play_labels.get(predicted, predicted)}")
+        st.markdown(f"**Run:** {run_prob*100:.1f}% | **Pass:** {pass_prob*100:.1f}%")
+        st.markdown(f"**💥 Pressure:** {pressure_prob*100:.1f}%")
         
-        risk = prediction.get('risk_level', 'medium')
         if risk == "low":
             st.success("🟢 Low Risk")
         elif risk == "medium":
@@ -105,6 +92,37 @@ def display_prediction(prediction, play_data=None):
         
         if play_data and play_data.get('number_of_pass_rushers', 0) >= 5:
             st.error("⚠️ BLITZ! 5+ rushers coming!")
+    else:
+        # Full display with columns for main views
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🎯 Play Type Prediction")
+            st.metric("Predicted Play", play_labels.get(predicted, predicted))
+            
+            st.markdown("**Run vs Pass:**")
+            col_r, col_p = st.columns(2)
+            with col_r:
+                st.progress(float(run_prob))
+                st.caption(f"Run: {run_prob*100:.1f}%")
+            with col_p:
+                st.progress(float(pass_prob))
+                st.caption(f"Pass: {pass_prob*100:.1f}%")
+        
+        with col2:
+            st.subheader("💥 Pressure Prediction")
+            st.metric("Pressure Probability", f"{pressure_prob*100:.1f}%")
+            st.progress(float(pressure_prob))
+            
+            if risk == "low":
+                st.success("🟢 Low Risk")
+            elif risk == "medium":
+                st.warning("🟡 Medium Risk")
+            else:
+                st.error("🔴 High Risk")
+            
+            if play_data and play_data.get('number_of_pass_rushers', 0) >= 5:
+                st.error("⚠️ BLITZ! 5+ rushers coming!")
 
 # Title
 st.title("🏈 NFL Real-Time Play Analytics")
@@ -151,7 +169,7 @@ if mode == "🎮 Demo Mode":
     prediction = get_prediction(current_play)
     
     if prediction:
-        display_prediction(prediction, current_play)
+        display_prediction(prediction, current_play, nested=False)
         
         st.markdown("---")
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
@@ -201,12 +219,11 @@ elif mode == "🔴 Live Kinesis":
                 if records:
                     st.success(f"Found {len(records)} records")
                     for i, (record, pred) in enumerate(zip(records, predictions)):
-                        with st.expander(f"Play {i+1}"):
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                st.json(record)
-                            with col_b:
-                                display_prediction(pred, record)
+                        with st.expander(f"Play {i+1}: Down {record.get('down', '?')} & {record.get('ydstogo', '?')}"):
+                            st.markdown("**Play Data:**")
+                            st.json(record)
+                            st.markdown("**Prediction:**")
+                            display_prediction(pred, record, nested=True)
                 else:
                     st.info("No new records in stream. Try sending some test data!")
             else:
@@ -275,7 +292,7 @@ elif mode == "⚙️ Manual Input":
     prediction = get_prediction(play_data)
     
     if prediction:
-        display_prediction(prediction, play_data)
+        display_prediction(prediction, play_data, nested=False)
 
 # Model info
 st.markdown("---")

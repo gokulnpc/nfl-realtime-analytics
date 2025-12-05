@@ -242,7 +242,7 @@ async def kinesis_fetch(limit: int = 10):
         shard_iterator = kinesis_client.get_shard_iterator(
             StreamName=KINESIS_STREAM,
             ShardId=shard_id,
-            ShardIteratorType='LATEST'
+            ShardIteratorType='TRIM_HORIZON'
         )['ShardIterator']
         
         # Fetch records
