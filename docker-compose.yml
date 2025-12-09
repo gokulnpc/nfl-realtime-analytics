@@ -15,18 +15,16 @@ services:
       - ./models:/app/models
     command: python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 
-  dashboard:
+  frontend:
     build:
-      context: .
+      context: ./frontend
       dockerfile: Dockerfile
-    container_name: nfl-dashboard
+    container_name: nfl-frontend
     ports:
-      - "8501:8501"
+      - "3000:3000"
     environment:
-      - API_URL=http://api:8000
+      - REACT_APP_API_URL=http://api:8000
     volumes:
-      - ./src:/app/src
-      - ./models:/app/models
-    command: streamlit run src/dashboard/app.py --server.address 0.0.0.0 --server.port 8501
+      - ./frontend/src:/app/src
     depends_on:
       - api
