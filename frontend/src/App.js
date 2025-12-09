@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import './App.css';
 
@@ -20,6 +20,9 @@ function App() {
   const [mode, setMode] = useState('manual');
   const [demoIndex, setDemoIndex] = useState(0);
   const [demoRunning, setDemoRunning] = useState(false);
+  const [kinesisStatus, setKinesisStatus] = useState(null);
+  const [kinesisPlays, setKinesisPlays] = useState([]);
+  const [livePolling, setLivePolling] = useState(false);
   
   const [playData, setPlayData] = useState({
     down: 1, ydstogo: 10, yardline_100: 75, qtr: 1,
@@ -28,9 +31,57 @@ function App() {
     defenders_in_box: 6, number_of_pass_rushers: 4
   });
 
+  const checkApiHealth = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_URL}/health`);
+      setApiStatus(response.data);
+    } catch (error) {
+      setApiStatus({ status: 'offline' });
+    }
+  }, []);
+
+  const checkKinesisStatus = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_URL}/kinesis/status`);
+      setKinesisStatus(response.data);
+    } catch (error) {
+      setKinesisStatus({ status: 'error' });
+    }
+  }, []);
+
+  const fetchKinesisPlays = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_URL}/kinesis/fetch?limit=10`);
+      if (response.data.status === 'success' && response.data.records.length > 0) {
+        setKinesisPlays(response.data.records);
+        // Show latest play prediction
+        const latestRecord = response.data.records[response.data.records.length - 1];
+        const latestPred = response.data.predictions[response.data.predictions.length - 1];
+        setPrediction({
+          expected_points: latestPred.expected_points,
+          ...latestPred.scoring_probs,
+          ...latestPred.play_type,
+          pressure_probability: latestPred.pressure.pressure_probability,
+          pressure_risk: latestPred.pressure.pressure_risk
+        });
+        setPlayData(prev => ({
+          ...prev,
+          down: latestRecord.down || 1,
+          ydstogo: latestRecord.ydstogo || 10,
+          yardline_100: latestRecord.yardline_100 || 75,
+          qtr: latestRecord.qtr || 1,
+          score_differential: latestRecord.score_differential || 0
+        }));
+      }
+    } catch (error) {
+      console.error('Kinesis fetch error:', error);
+    }
+  }, []);
+
   useEffect(() => {
     checkApiHealth();
-  }, []);
+    checkKinesisStatus();
+  }, [checkApiHealth, checkKinesisStatus]);
 
   useEffect(() => {
     if (demoRunning && mode === 'demo') {
@@ -43,14 +94,14 @@ function App() {
     }
   }, [demoRunning, demoIndex, mode]);
 
-  const checkApiHealth = async () => {
-    try {
-      const response = await axios.get(`${API_URL}/health`);
-      setApiStatus(response.data);
-    } catch (error) {
-      setApiStatus({ status: 'offline' });
+  useEffect(() => {
+    if (livePolling && mode === 'live') {
+      const interval = setInterval(() => {
+        fetchKinesisPlays();
+      }, 3000);
+      return () => clearInterval(interval);
     }
-  };
+  }, [livePolling, mode, fetchKinesisPlays]);
 
   const getPrediction = async (data) => {
     setLoading(true);
@@ -77,10 +128,21 @@ function App() {
     setMode('demo');
     setDemoIndex(0);
     setDemoRunning(true);
+    setLivePolling(false);
     getPrediction(DEMO_PLAYS[0]);
   };
 
-  const stopDemo = () => setDemoRunning(false);
+  const startLive = () => {
+    setMode('live');
+    setDemoRunning(false);
+    setLivePolling(true);
+    fetchKinesisPlays();
+  };
+
+  const stopAll = () => {
+    setDemoRunning(false);
+    setLivePolling(false);
+  };
 
   const formatPercent = (value) => `${(value * 100).toFixed(1)}%`;
 
@@ -103,7 +165,7 @@ function App() {
       </header>
 
       <div className="mode-buttons">
-        <button onClick={() => setMode('manual')}
+        <button onClick={() => { setMode('manual'); stopAll(); }}
           className={`mode-btn ${mode === 'manual' ? 'mode-btn-active' : 'mode-btn-inactive'}`}>
           ⚙️ Manual Input
         </button>
@@ -111,17 +173,45 @@ function App() {
           className={`mode-btn ${mode === 'demo' ? 'mode-btn-active' : 'mode-btn-inactive'}`}>
           🎮 Demo Mode
         </button>
-        {demoRunning && (
-          <button onClick={stopDemo} className="mode-btn mode-btn-stop">
+        <button onClick={startLive}
+          className={`mode-btn ${mode === 'live' ? 'mode-btn-live' : 'mode-btn-inactive'}`}>
+          🔴 Live Kinesis
+        </button>
+        {(demoRunning || livePolling) && (
+          <button onClick={stopAll} className="mode-btn mode-btn-stop">
             ⏹️ Stop
           </button>
         )}
       </div>
 
+      {/* Kinesis Status Banner */}
+      {mode === 'live' && (
+        <div className="kinesis-banner">
+          {kinesisStatus?.status === 'connected' ? (
+            <span className="kinesis-connected">
+              🟢 Connected to Kinesis: {kinesisStatus.stream_name} | Shards: {kinesisStatus.shard_count} | 
+              {livePolling ? ' Polling every 3s...' : ' Click to start polling'}
+            </span>
+          ) : (
+            <span className="kinesis-disconnected">
+              🔴 Kinesis not connected - Check AWS credentials in .env
+            </span>
+          )}
+          {kinesisPlays.length > 0 && (
+            <span className="kinesis-plays-count">
+              📊 {kinesisPlays.length} plays received
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="grid-container">
         {/* Input Panel */}
         <div className="card">
-          <h2>{mode === 'demo' ? '📍 Current Play' : '📝 Game Situation'}</h2>
+          <h2>
+            {mode === 'demo' ? '📍 Current Play' : 
+             mode === 'live' ? '📡 Live Feed' : '📝 Game Situation'}
+          </h2>
           
           {mode === 'demo' ? (
             <div>
@@ -149,6 +239,53 @@ function App() {
               <p style={{textAlign: 'center', color: '#94a3b8', marginTop: '16px'}}>
                 Play {demoIndex + 1} of {DEMO_PLAYS.length}
               </p>
+            </div>
+          ) : mode === 'live' ? (
+            <div>
+              {kinesisPlays.length > 0 ? (
+                <>
+                  <div className="demo-description">
+                    <p>
+                      {kinesisPlays[kinesisPlays.length - 1].posteam || 'Team'} vs {kinesisPlays[kinesisPlays.length - 1].defteam || 'Opp'}
+                    </p>
+                    <p style={{fontSize: '14px', marginTop: '8px'}}>
+                      {kinesisPlays[kinesisPlays.length - 1].desc || 'Live play data'}
+                    </p>
+                  </div>
+                  <div className="stats-grid">
+                    <div className="stat-box">
+                      <span>Down</span>
+                      <p>{kinesisPlays[kinesisPlays.length - 1].down || '-'}</p>
+                    </div>
+                    <div className="stat-box">
+                      <span>Distance</span>
+                      <p>{kinesisPlays[kinesisPlays.length - 1].ydstogo || '-'}</p>
+                    </div>
+                    <div className="stat-box">
+                      <span>Yard Line</span>
+                      <p>{kinesisPlays[kinesisPlays.length - 1].yardline_100 ? 100 - kinesisPlays[kinesisPlays.length - 1].yardline_100 : '-'}</p>
+                    </div>
+                    <div className="stat-box">
+                      <span>Quarter</span>
+                      <p>Q{kinesisPlays[kinesisPlays.length - 1].qtr || '-'}</p>
+                    </div>
+                  </div>
+                  <div className="plays-list">
+                    <h4>Recent Plays</h4>
+                    {kinesisPlays.slice(-5).reverse().map((play, i) => (
+                      <div key={i} className="play-item">
+                        {play.down}&{play.ydstogo} at {100 - (play.yardline_100 || 0)} - Q{play.qtr}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="empty-state">
+                  <p>📡</p>
+                  <p>Waiting for Kinesis data...</p>
+                  <p style={{fontSize: '12px'}}>Run the live demo simulator to send plays</p>
+                </div>
+              )}
             </div>
           ) : (
             <div>
@@ -266,17 +403,17 @@ function App() {
             <div>
               <p style={{color: '#94a3b8', marginBottom: '8px'}}>Predicted Play Type</p>
               <div className="play-type-box">
-                <p>{prediction.predicted_play.replace('_', ' ')}</p>
+                <p>{prediction.predicted_play?.replace('_', ' ') || 'Unknown'}</p>
               </div>
               
               <div className="run-pass-grid">
                 <div className="run-pass-box">
                   <p>Run</p>
-                  <p className="text-orange">{formatPercent(prediction.run_probability)}</p>
+                  <p className="text-orange">{formatPercent(prediction.run_probability || 0)}</p>
                 </div>
                 <div className="run-pass-box">
                   <p>Pass</p>
-                  <p className="text-blue">{formatPercent(prediction.pass_probability)}</p>
+                  <p className="text-blue">{formatPercent(prediction.pass_probability || 0)}</p>
                 </div>
               </div>
               
@@ -285,7 +422,7 @@ function App() {
                 prediction.pressure_risk === 'high' ? 'pressure-high' :
                 prediction.pressure_risk === 'medium' ? 'pressure-medium' : 'pressure-low'
               }`}>
-                <p>{formatPercent(prediction.pressure_probability)}</p>
+                <p>{formatPercent(prediction.pressure_probability || 0)}</p>
                 <p>{prediction.pressure_risk === 'high' ? '🔴 HIGH RISK' :
                     prediction.pressure_risk === 'medium' ? '🟡 MEDIUM RISK' : '🟢 LOW RISK'}</p>
               </div>
