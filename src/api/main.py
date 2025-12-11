@@ -1,20 +1,21 @@
 """
-FastAPI Backend - Reads predictions from PySpark Parquet output
+FastAPI Backend - Full ESPN Data v2 + Rule-Based Predictions
+Supports enhanced data: headshots, receiving leaders, full odds, tickets
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
-import joblib
+from typing import Optional, Any
 import pandas as pd
 import numpy as np
 import os
 import json
 import boto3
 from datetime import datetime
+from pathlib import Path
 
-app = FastAPI(title="NFL Real-Time Analytics API", version="3.0")
+app = FastAPI(title="NFL Real-Time Analytics API", version="4.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,31 +25,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Paths
-MODELS_PATH = "/Users/adithyahnair/nfl-project/models"
-PARQUET_PATH = "/Users/adithyahnair/nfl-project/data/live_predictions/latest"
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+PARQUET_PATH = PROJECT_ROOT / "data" / "live_predictions" / "latest"
 
-# Load ML models
-models = {}
-
-def load_models():
-    global models
-    model_files = {
-        'play_classifier': 'play_classifier.joblib',
-        'pressure_predictor': 'pressure_predictor.joblib',
-        'expected_points': 'expected_points.joblib',
-        'scoring_probability': 'scoring_probability.joblib'
-    }
-    
-    for name, filename in model_files.items():
-        path = os.path.join(MODELS_PATH, filename)
-        if os.path.exists(path):
-            models[name] = joblib.load(path)
-            print(f"✅ Loaded {name}")
-        else:
-            print(f"⚠️ Model not found: {path}")
-
-load_models()
+print(f"📁 Project Root: {PROJECT_ROOT}")
+print(f"🧮 Using rule-based predictions (ML models require more features)")
 
 class PlayInput(BaseModel):
     down: int
@@ -66,243 +47,316 @@ class PlayInput(BaseModel):
     posteam: Optional[str] = None
     defteam: Optional[str] = None
 
+def clean_data_for_json(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {k: clean_data_for_json(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [clean_data_for_json(item) for item in data]
+    elif isinstance(data, (np.integer,)):
+        return int(data)
+    elif isinstance(data, (np.floating,)):
+        return float(data) if not np.isnan(data) else None
+    elif isinstance(data, np.ndarray):
+        return data.tolist()
+    elif pd.isna(data):
+        return None
+    return data
+
+def get_predictions(play_data: dict) -> dict:
+    """Generate predictions using rule-based formulas"""
+    
+    down = play_data.get('down', 1)
+    ydstogo = play_data.get('ydstogo', 10)
+    yardline_100 = play_data.get('yardline_100', 75)
+    qtr = play_data.get('qtr', 1)
+    seconds = play_data.get('half_seconds_remaining', 900)
+    score_diff = play_data.get('score_differential', 0)
+    shotgun = play_data.get('shotgun', 1)
+    defenders = play_data.get('defenders_in_box', 6)
+    rushers = play_data.get('number_of_pass_rushers', 4)
+    
+    # Expected Points (based on field position and down)
+    ep = (100 - yardline_100) * 0.06 - 1.0
+    if down == 1: ep += 0.5
+    elif down == 2: ep += 0.1
+    elif down == 3: ep -= 0.4
+    elif down == 4: ep -= 1.2
+    if ydstogo <= 3: ep += 0.4
+    elif ydstogo >= 10: ep -= 0.3
+    if yardline_100 <= 20: ep += 1.5
+    if yardline_100 <= 10: ep += 1.0
+    if yardline_100 <= 5: ep += 0.5
+    
+    # TD Probability
+    if yardline_100 <= 5: td_prob = 0.55
+    elif yardline_100 <= 10: td_prob = 0.40
+    elif yardline_100 <= 20: td_prob = 0.28
+    elif yardline_100 <= 50: td_prob = 0.15
+    else: td_prob = 0.08
+    if down == 1: td_prob *= 1.1
+    elif down == 4: td_prob *= 0.5
+    td_prob = min(td_prob, 0.95)
+    
+    # FG Probability
+    fg_distance = yardline_100 + 17
+    if fg_distance <= 30: fg_prob = 0.92
+    elif fg_distance <= 40: fg_prob = 0.82
+    elif fg_distance <= 50: fg_prob = 0.65
+    elif fg_distance <= 55: fg_prob = 0.45
+    else: fg_prob = 0.25
+    
+    # No Score Probability
+    no_score_prob = max(0.05, 1.0 - td_prob - fg_prob * 0.3)
+    
+    # Pass Probability (based on situation)
+    pass_prob = 0.55  # Base
+    if ydstogo >= 7: pass_prob = 0.72
+    if ydstogo >= 10: pass_prob = 0.78
+    if down == 3 and ydstogo >= 5: pass_prob = 0.82
+    if seconds < 120 and score_diff < 0: pass_prob = 0.85  # Two-minute drill
+    if ydstogo <= 2: pass_prob = 0.40  # Short yardage
+    if shotgun == 1: pass_prob += 0.10
+    pass_prob = min(pass_prob, 0.95)
+    run_prob = 1.0 - pass_prob
+    
+    # Predicted play
+    if ydstogo <= 2: predicted = 'run'
+    elif down == 4 and yardline_100 > 40: predicted = 'punt'
+    elif down == 4 and yardline_100 <= 40: predicted = 'field_goal'
+    elif pass_prob > 0.6: predicted = 'pass'
+    else: predicted = 'run'
+    
+    # Pressure Risk
+    pressure_prob = 0.25  # Base
+    if rushers >= 5: pressure_prob = 0.45
+    if rushers >= 6: pressure_prob = 0.55
+    if defenders >= 8: pressure_prob += 0.10
+    if down == 3 and ydstogo >= 7: pressure_prob += 0.10
+    pressure_prob = min(pressure_prob, 0.80)
+    
+    if pressure_prob >= 0.45: pressure_risk = 'high'
+    elif pressure_prob >= 0.30: pressure_risk = 'medium'
+    else: pressure_risk = 'low'
+    
+    return {
+        'expected_points': round(ep, 2),
+        'td_prob': round(td_prob, 3),
+        'fg_prob': round(fg_prob, 3),
+        'no_score_prob': round(no_score_prob, 3),
+        'opp_td_prob': round(0.05, 3),
+        'opp_fg_prob': round(0.02, 3),
+        'pass_probability': round(pass_prob, 3),
+        'run_probability': round(run_prob, 3),
+        'predicted_play': predicted,
+        'pressure_probability': round(pressure_prob, 3),
+        'pressure_risk': pressure_risk
+    }
+
 @app.get("/")
 async def root():
     return {
-        "message": "NFL Real-Time Analytics API v3.0",
-        "models_loaded": list(models.keys()),
-        "pyspark_integration": True
+        "message": "NFL Real-Time Analytics API v4.3",
+        "prediction_method": "rule-based",
+        "full_espn_data": True,
+        "enhanced_fields": [
+            "player_headshots",
+            "receiving_leaders", 
+            "full_stat_lines",
+            "enhanced_odds",
+            "home_away_records",
+            "tickets",
+            "geo_broadcasts",
+            "win_probability_history"
+        ]
     }
 
 @app.get("/health")
 async def health():
-    parquet_exists = os.path.exists(PARQUET_PATH)
+    kinesis_ok = False
+    try:
+        boto3.client('kinesis', region_name='us-east-1').describe_stream(StreamName='nfl-play-stream')
+        kinesis_ok = True
+    except: pass
+    
     return {
         "status": "healthy",
-        "models_loaded": len(models),
-        "model_names": list(models.keys()),
-        "pyspark_output_available": parquet_exists
+        "prediction_method": "rule-based",
+        "pyspark_output_available": PARQUET_PATH.exists(),
+        "kinesis_connected": kinesis_ok
     }
 
 @app.post("/predict")
 async def predict(play: PlayInput):
-    """Get all predictions for a play using ML models"""
-    
-    features = prepare_features(play)
-    result = {}
-    
-    # Expected Points
-    if 'expected_points' in models:
-        ep_features = features[['down', 'ydstogo', 'yardline_100', 'qtr', 
-                                'half_seconds_remaining', 'score_differential',
-                                'posteam_is_home', 'goal_to_go', 'shotgun', 'no_huddle']]
-        result['expected_points'] = round(float(models['expected_points'].predict(ep_features)[0]), 2)
-    
-    # Scoring Probability
-    if 'scoring_probability' in models:
-        sp_features = features[['down', 'ydstogo', 'yardline_100', 'qtr',
-                                'half_seconds_remaining', 'score_differential',
-                                'posteam_is_home', 'goal_to_go', 'shotgun', 'no_huddle']]
-        probs = models['scoring_probability'].predict(sp_features)[0]
-        result['td_prob'] = round(float(probs[0]), 3)
-        result['fg_prob'] = round(float(probs[1]), 3)
-        result['no_score_prob'] = round(float(probs[2]), 3)
-        result['opp_td_prob'] = round(float(probs[3]), 3)
-        result['opp_fg_prob'] = round(float(probs[4]), 3)
-        result['safety_prob'] = round(float(probs[5]), 3)
-        result['opp_safety_prob'] = round(float(probs[6]), 3)
-    
-    # Play Type
-    if 'play_classifier' in models:
-        pc_features = features[['down', 'ydstogo', 'yardline_100', 'qtr',
-                                'half_seconds_remaining', 'score_differential',
-                                'shotgun', 'no_huddle', 'defenders_in_box',
-                                'number_of_pass_rushers']]
-        pred = models['play_classifier'].predict(pc_features)[0]
-        proba = models['play_classifier'].predict_proba(pc_features)[0]
-        result['predicted_play'] = pred
-        result['run_probability'] = round(float(proba[0] + proba[1]), 3)
-        result['pass_probability'] = round(float(proba[2] + proba[3] + proba[4]), 3)
-    
-    # Pressure
-    if 'pressure_predictor' in models:
-        pp_features = features[['down', 'ydstogo', 'yardline_100', 'shotgun',
-                                'no_huddle', 'defenders_in_box', 'number_of_pass_rushers']]
-        pressure_prob = models['pressure_predictor'].predict_proba(pp_features)[0][1]
-        result['pressure_probability'] = round(float(pressure_prob), 3)
-        result['pressure_risk'] = 'high' if pressure_prob > 0.5 else 'medium' if pressure_prob > 0.3 else 'low'
-    
-    return result
-
-def prepare_features(play: PlayInput) -> pd.DataFrame:
-    """Prepare features DataFrame from play input"""
-    data = {
-        'down': [play.down],
-        'ydstogo': [play.ydstogo],
-        'yardline_100': [play.yardline_100],
-        'qtr': [play.qtr],
-        'half_seconds_remaining': [play.half_seconds_remaining],
-        'score_differential': [play.score_differential],
-        'shotgun': [play.shotgun],
-        'no_huddle': [play.no_huddle],
-        'defenders_in_box': [play.defenders_in_box],
-        'number_of_pass_rushers': [play.number_of_pass_rushers],
-        'posteam_is_home': [1 if play.posteam_type == 'home' else 0],
-        'goal_to_go': [play.goal_to_go]
-    }
-    return pd.DataFrame(data)
-
-# ============================================================
-# PYSPARK INTEGRATION - Read from Parquet
-# ============================================================
-
-@app.get("/pyspark/predictions")
-async def get_pyspark_predictions():
-    """Get latest predictions from PySpark Parquet output"""
-    
-    if not os.path.exists(PARQUET_PATH):
-        return {
-            "status": "no_data",
-            "message": "PySpark has not processed any data yet. Run spark_stream_processor.py",
-            "plays": []
-        }
-    
-    try:
-        df = pd.read_parquet(PARQUET_PATH)
-        
-        if df.empty:
-            return {"status": "empty", "plays": []}
-        
-        # Convert to list of dicts
-        plays = df.to_dict(orient='records')
-        
-        # Clean up NaN values
-        for play in plays:
-            for key, value in play.items():
-                if pd.isna(value):
-                    play[key] = None
-                elif isinstance(value, (np.integer, np.floating)):
-                    play[key] = float(value)
-        
-        return {
-            "status": "success",
-            "source": "pyspark",
-            "play_count": len(plays),
-            "plays": plays
-        }
-        
-    except Exception as e:
-        return {"status": "error", "message": str(e), "plays": []}
-
-@app.get("/pyspark/latest")
-async def get_latest_pyspark():
-    """Get only the most recent play from PySpark output"""
-    
-    if not os.path.exists(PARQUET_PATH):
-        return {"status": "no_data", "play": None}
-    
-    try:
-        df = pd.read_parquet(PARQUET_PATH)
-        
-        if df.empty:
-            return {"status": "empty", "play": None}
-        
-        # Get latest play
-        latest = df.iloc[-1].to_dict()
-        
-        # Clean NaN
-        for key, value in latest.items():
-            if pd.isna(value):
-                latest[key] = None
-            elif isinstance(value, (np.integer, np.floating)):
-                latest[key] = float(value)
-        
-        return {
-            "status": "success",
-            "source": "pyspark",
-            "play": latest
-        }
-        
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# ============================================================
-# KINESIS DIRECT (Fallback - kept for compatibility)
-# ============================================================
+    return {"input": play.dict(), "predictions": get_predictions(play.dict())}
 
 @app.get("/kinesis/status")
 async def kinesis_status():
-    """Check Kinesis connection status"""
     try:
         kinesis = boto3.client('kinesis', region_name='us-east-1')
-        response = kinesis.describe_stream(StreamName='nfl-play-stream')
-        
-        return {
-            "connected": True,
-            "stream_name": "nfl-play-stream",
-            "status": response['StreamDescription']['StreamStatus'],
-            "shard_count": len(response['StreamDescription']['Shards']),
-            "note": "Use /pyspark/predictions for PySpark-processed data"
-        }
+        resp = kinesis.describe_stream(StreamName='nfl-play-stream')
+        return {"connected": True, "status": resp['StreamDescription']['StreamStatus']}
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
 @app.get("/kinesis/fetch")
 async def fetch_kinesis():
-    """Fetch directly from Kinesis (fallback, bypasses PySpark)"""
     try:
         kinesis = boto3.client('kinesis', region_name='us-east-1')
+        resp = kinesis.describe_stream(StreamName='nfl-play-stream')
+        shard_id = resp['StreamDescription']['Shards'][0]['ShardId']
         
-        response = kinesis.describe_stream(StreamName='nfl-play-stream')
-        shard_id = response['StreamDescription']['Shards'][0]['ShardId']
-        
-        shard_iterator = kinesis.get_shard_iterator(
-            StreamName='nfl-play-stream',
-            ShardId=shard_id,
-            ShardIteratorType='TRIM_HORIZON'
+        shard_iter = kinesis.get_shard_iterator(
+            StreamName='nfl-play-stream', ShardId=shard_id, ShardIteratorType='TRIM_HORIZON'
         )['ShardIterator']
         
-        records_response = kinesis.get_records(ShardIterator=shard_iterator, Limit=100)
+        records = kinesis.get_records(ShardIterator=shard_iter, Limit=100)['Records']
         
         plays = []
-        for record in records_response['Records']:
+        for rec in records:
             try:
-                data = json.loads(record['Data'].decode('utf-8'))
+                raw = json.loads(rec['Data'].decode('utf-8'))
+                preds = get_predictions(raw)
                 
-                # Add predictions using ML models
-                play_input = PlayInput(**{
-                    'down': data.get('down', 1),
-                    'ydstogo': data.get('ydstogo', 10),
-                    'yardline_100': data.get('yardline_100', 75),
-                    'qtr': data.get('qtr', 1),
-                    'half_seconds_remaining': data.get('half_seconds_remaining', 900),
-                    'score_differential': data.get('score_differential', 0),
-                    'shotgun': data.get('shotgun', 1),
-                    'no_huddle': data.get('no_huddle', 0),
-                    'defenders_in_box': data.get('defenders_in_box', 6),
-                    'number_of_pass_rushers': data.get('number_of_pass_rushers', 4),
-                    'posteam_type': data.get('posteam_type', 'home'),
-                    'goal_to_go': data.get('goal_to_go', 0),
-                    'posteam': data.get('posteam'),
-                    'defteam': data.get('defteam')
-                })
-                
-                predictions = await predict(play_input)
-                data.update(predictions)
-                plays.append(data)
+                play = {
+                    # === Identifiers ===
+                    "game_id": raw.get('game_id'),
+                    "event_uid": raw.get('event_uid'),
+                    "timestamp": raw.get('timestamp'),
+                    "source": raw.get('source'),
+                    
+                    # === Situation (for predictions) ===
+                    "down": raw.get('down'),
+                    "ydstogo": raw.get('ydstogo'),
+                    "yardline_100": raw.get('yardline_100'),
+                    "qtr": raw.get('qtr'),
+                    "half_seconds_remaining": raw.get('half_seconds_remaining'),
+                    "score_differential": raw.get('score_differential'),
+                    "goal_to_go": raw.get('goal_to_go'),
+                    "posteam": raw.get('posteam'),
+                    "defteam": raw.get('defteam'),
+                    "posteam_type": raw.get('posteam_type'),
+                    
+                    # === Game Status ===
+                    "status": raw.get('status'),
+                    "situation": raw.get('situation'),
+                    
+                    # === Teams - Basic ===
+                    "home_team": raw.get('home_team'),
+                    "away_team": raw.get('away_team'),
+                    "home_score": raw.get('home_score'),
+                    "away_score": raw.get('away_score'),
+                    
+                    # === Teams - Full (includes leaders with headshots, records) ===
+                    "home_team_full": raw.get('home_team_full'),
+                    "away_team_full": raw.get('away_team_full'),
+                    
+                    # === NEW: Game-Level Leaders (top across both teams) ===
+                    "gameLeaders": raw.get('gameLeaders'),
+                    
+                    # === Weather ===
+                    "weather": raw.get('weather'),
+                    
+                    # === Venue ===
+                    "venue": raw.get('venue'),
+                    
+                    # === Odds (enhanced with moneylines, spread odds) ===
+                    "odds": raw.get('odds'),
+                    
+                    # === ESPN Win Probability ===
+                    "predictor": raw.get('predictor'),
+                    
+                    # === NEW: Win Probability History (for charts) ===
+                    "winProbabilityHistory": raw.get('winProbabilityHistory'),
+                    
+                    # === Broadcasts ===
+                    "broadcasts": raw.get('broadcasts'),
+                    
+                    # === NEW: Geo Broadcasts (streaming options) ===
+                    "geoBroadcasts": raw.get('geoBroadcasts'),
+                    
+                    # === NEW: Tickets ===
+                    "tickets": raw.get('tickets'),
+                    
+                    # === NEW: Links (gamecast, boxscore) ===
+                    "links": raw.get('links'),
+                    
+                    # === Last Play ===
+                    "lastPlay": raw.get('lastPlay'),
+                    
+                    # === Event Metadata ===
+                    "event": raw.get('event'),
+                    
+                    # === Game Info ===
+                    "gameInfo": raw.get('gameInfo'),
+                    
+                    # === Predictions (rule-based) ===
+                    "ml_predictions": preds,
+                    **preds  # Flat predictions for easy access
+                }
+                plays.append(clean_data_for_json(play))
             except Exception as e:
-                continue
+                print(f"Error processing record: {e}")
         
-        return {
-            "status": "success",
-            "source": "kinesis_direct",
-            "play_count": len(plays),
-            "plays": plays,
-            "note": "For PySpark-processed data, use /pyspark/predictions"
-        }
-        
+        return {"status": "success", "source": "kinesis", "play_count": len(plays), "plays": plays}
     except Exception as e:
         return {"status": "error", "error": str(e), "plays": []}
+
+@app.get("/kinesis/latest")
+async def fetch_latest():
+    result = await fetch_kinesis()
+    if result.get('plays'):
+        return {"status": "success", "play": result['plays'][-1]}
+    return {"status": "no_data", "play": None}
+
+@app.get("/pyspark/predictions")
+async def get_pyspark():
+    if not PARQUET_PATH.exists():
+        return {"status": "no_data", "plays": []}
+    try:
+        df = pd.read_parquet(PARQUET_PATH)
+        return {"status": "success", "plays": [clean_data_for_json(p) for p in df.to_dict('records')]}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "plays": []}
+
+@app.get("/teams")
+async def get_teams():
+    teams = [
+        {"abbr": "ARI", "name": "Arizona Cardinals", "color": "97233F"},
+        {"abbr": "ATL", "name": "Atlanta Falcons", "color": "A71930"},
+        {"abbr": "BAL", "name": "Baltimore Ravens", "color": "241773"},
+        {"abbr": "BUF", "name": "Buffalo Bills", "color": "00338D"},
+        {"abbr": "CAR", "name": "Carolina Panthers", "color": "0085CA"},
+        {"abbr": "CHI", "name": "Chicago Bears", "color": "0B162A"},
+        {"abbr": "CIN", "name": "Cincinnati Bengals", "color": "FB4F14"},
+        {"abbr": "CLE", "name": "Cleveland Browns", "color": "311D00"},
+        {"abbr": "DAL", "name": "Dallas Cowboys", "color": "003594"},
+        {"abbr": "DEN", "name": "Denver Broncos", "color": "FB4F14"},
+        {"abbr": "DET", "name": "Detroit Lions", "color": "0076B6"},
+        {"abbr": "GB", "name": "Green Bay Packers", "color": "203731"},
+        {"abbr": "HOU", "name": "Houston Texans", "color": "03202F"},
+        {"abbr": "IND", "name": "Indianapolis Colts", "color": "002C5F"},
+        {"abbr": "JAX", "name": "Jacksonville Jaguars", "color": "006778"},
+        {"abbr": "KC", "name": "Kansas City Chiefs", "color": "E31837"},
+        {"abbr": "LAC", "name": "Los Angeles Chargers", "color": "0080C6"},
+        {"abbr": "LAR", "name": "Los Angeles Rams", "color": "003594"},
+        {"abbr": "LV", "name": "Las Vegas Raiders", "color": "000000"},
+        {"abbr": "MIA", "name": "Miami Dolphins", "color": "008E97"},
+        {"abbr": "MIN", "name": "Minnesota Vikings", "color": "4F2683"},
+        {"abbr": "NE", "name": "New England Patriots", "color": "002244"},
+        {"abbr": "NO", "name": "New Orleans Saints", "color": "D3BC8D"},
+        {"abbr": "NYG", "name": "New York Giants", "color": "0B2265"},
+        {"abbr": "NYJ", "name": "New York Jets", "color": "125740"},
+        {"abbr": "PHI", "name": "Philadelphia Eagles", "color": "004C54"},
+        {"abbr": "PIT", "name": "Pittsburgh Steelers", "color": "FFB612"},
+        {"abbr": "SEA", "name": "Seattle Seahawks", "color": "002244"},
+        {"abbr": "SF", "name": "San Francisco 49ers", "color": "AA0000"},
+        {"abbr": "TB", "name": "Tampa Bay Buccaneers", "color": "D50A0A"},
+        {"abbr": "TEN", "name": "Tennessee Titans", "color": "0C2340"},
+        {"abbr": "WAS", "name": "Washington Commanders", "color": "5A1414"}
+    ]
+    for t in teams:
+        t['logo'] = f"https://a.espncdn.com/i/teamlogos/nfl/500/{t['abbr'].lower()}.png"
+    return {"teams": teams}
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,6 +1,6 @@
 """
-AWS Lambda: ESPN NFL Live Poller - FULL DATA CAPTURE
-Captures ALL available ESPN data and sends to Kinesis
+AWS Lambda: ESPN NFL Live Poller - FULL DATA CAPTURE v2
+Captures ALL available ESPN data including headshots, full stats, enhanced odds
 """
 
 import json
@@ -36,6 +36,98 @@ def get_game_summary(game_id):
         print(f"Error fetching summary {game_id}: {e}")
     return None
 
+def extract_leader_data(leader_info):
+    """Extract full leader data including headshot, jersey, full stat line"""
+    if not leader_info or not leader_info.get('leaders'):
+        return None
+    
+    top_leader = leader_info['leaders'][0]
+    athlete = top_leader.get('athlete', {})
+    
+    return {
+        'name': athlete.get('fullName') or athlete.get('displayName'),
+        'shortName': athlete.get('shortName'),
+        'displayName': athlete.get('displayName'),
+        'headshot': athlete.get('headshot'),
+        'jersey': athlete.get('jersey'),
+        'position': athlete.get('position', {}).get('abbreviation'),
+        'teamId': athlete.get('team', {}).get('id'),
+        'playerId': athlete.get('id'),
+        'displayValue': top_leader.get('displayValue'),  # Full stat line: "299/474, 3398 YDS, 22 TD"
+        'value': top_leader.get('value'),  # Numeric value for sorting
+        'active': athlete.get('active', True)
+    }
+
+def extract_odds_data(odds_list):
+    """Extract comprehensive odds data including moneylines and spread odds"""
+    if not odds_list:
+        return {}
+    
+    odds = odds_list[0]
+    
+    # Extract moneyline data
+    moneyline = odds.get('moneyline', {})
+    home_ml = moneyline.get('home', {}).get('close', {}).get('odds')
+    away_ml = moneyline.get('away', {}).get('close', {}).get('odds')
+    
+    # Extract point spread data
+    point_spread = odds.get('pointSpread', {})
+    home_spread = point_spread.get('home', {}).get('close', {})
+    away_spread = point_spread.get('away', {}).get('close', {})
+    
+    # Extract total (over/under) data
+    total = odds.get('total', {})
+    over_data = total.get('over', {}).get('close', {})
+    under_data = total.get('under', {}).get('close', {})
+    
+    return {
+        'provider': odds.get('provider', {}).get('name'),
+        'providerId': odds.get('provider', {}).get('id'),
+        'details': odds.get('details'),  # e.g., "KC -5.5"
+        'spread': odds.get('spread'),
+        'overUnder': odds.get('overUnder'),
+        
+        # Enhanced moneyline
+        'moneyline': {
+            'home': home_ml,
+            'away': away_ml,
+            'homeOpen': moneyline.get('home', {}).get('open', {}).get('odds'),
+            'awayOpen': moneyline.get('away', {}).get('open', {}).get('odds')
+        },
+        
+        # Enhanced spread
+        'pointSpread': {
+            'home': {
+                'line': home_spread.get('line'),
+                'odds': home_spread.get('odds')
+            },
+            'away': {
+                'line': away_spread.get('line'),
+                'odds': away_spread.get('odds')
+            }
+        },
+        
+        # Enhanced total
+        'total': {
+            'over': {
+                'line': over_data.get('line'),
+                'odds': over_data.get('odds')
+            },
+            'under': {
+                'line': under_data.get('line'),
+                'odds': under_data.get('odds')
+            }
+        },
+        
+        # Favorite info
+        'homeFavorite': odds.get('homeTeamOdds', {}).get('favorite', False),
+        'awayFavorite': odds.get('awayTeamOdds', {}).get('favorite', False),
+        
+        # Legacy fields for backwards compatibility
+        'homeMoneyLine': home_ml,
+        'awayMoneyLine': away_ml
+    }
+
 def extract_full_data(event_data, summary_data):
     """Extract ALL available data from ESPN"""
     
@@ -53,6 +145,7 @@ def extract_full_data(event_data, summary_data):
         team_info = comp.get('team', {})
         team_data = {
             'id': team_info.get('id'),
+            'uid': team_info.get('uid'),
             'abbreviation': team_info.get('abbreviation'),
             'name': team_info.get('name'),
             'displayName': team_info.get('displayName'),
@@ -62,33 +155,71 @@ def extract_full_data(event_data, summary_data):
             'logo': team_info.get('logo'),
             'score': int(comp.get('score', 0)),
             'winner': comp.get('winner'),
-            'records': []
+            'homeAway': comp.get('homeAway'),
+            
+            # Enhanced records structure
+            'records': {
+                'overall': None,
+                'home': None,
+                'away': None
+            }
         }
         
-        # Records (W-L)
+        # Records (W-L) - Parse into structured format
         for record in comp.get('records', []):
-            team_data['records'].append({
-                'type': record.get('type'),
-                'summary': record.get('summary')
-            })
+            record_type = record.get('type', record.get('name', ''))
+            summary = record.get('summary')
+            if record_type in ['total', 'overall']:
+                team_data['records']['overall'] = summary
+            elif record_type == 'home':
+                team_data['records']['home'] = summary
+            elif record_type in ['road', 'away']:
+                team_data['records']['away'] = summary
         
-        # Leaders
-        team_data['leaders'] = {}
+        # Legacy record format for compatibility
+        team_data['record'] = team_data['records']['overall']
+        
+        # Leaders - Enhanced with full data including headshots
+        team_data['leaders'] = {
+            'passing': None,
+            'rushing': None,
+            'receiving': None
+        }
+        
         for leader in comp.get('leaders', []):
-            leader_name = leader.get('name', '')
-            if leader.get('leaders'):
-                top_leader = leader['leaders'][0]
-                athlete = top_leader.get('athlete', {})
-                team_data['leaders'][leader_name] = {
-                    'name': athlete.get('displayName'),
-                    'position': athlete.get('position', {}).get('abbreviation'),
-                    'value': top_leader.get('displayValue')
-                }
+            leader_name = leader.get('name', '').lower()
+            leader_data = extract_leader_data(leader)
+            
+            if 'passing' in leader_name:
+                team_data['leaders']['passing'] = leader_data
+            elif 'rushing' in leader_name:
+                team_data['leaders']['rushing'] = leader_data
+            elif 'receiving' in leader_name:
+                team_data['leaders']['receiving'] = leader_data
         
         if comp.get('homeAway') == 'home':
             home_team = team_data
         else:
             away_team = team_data
+    
+    # ========== GAME-LEVEL LEADERS ==========
+    # These are the top leaders across both teams
+    game_leaders = {
+        'passing': None,
+        'rushing': None,
+        'receiving': None
+    }
+    
+    for leader in competition.get('leaders', []):
+        leader_name = leader.get('name', '').lower()
+        leader_data = extract_leader_data(leader)
+        
+        if 'passing' in leader_name:
+            game_leaders['passing'] = leader_data
+        elif 'rushing' in leader_name:
+            game_leaders['rushing'] = leader_data
+        elif 'receiving' in leader_name:
+            game_leaders['receiving'] = leader_data
     
     # ========== SITUATION DATA (Current Play) ==========
     situation = {}
@@ -133,7 +264,8 @@ def extract_full_data(event_data, summary_data):
         'displayValue': weather.get('displayValue'),
         'conditionId': weather.get('conditionId'),
         'highTemperature': weather.get('highTemperature'),
-        'gust': weather.get('gust')
+        'gust': weather.get('gust'),
+        'link': weather.get('link', {}).get('href')
     }
     
     # ========== VENUE DATA ==========
@@ -141,29 +273,17 @@ def extract_full_data(event_data, summary_data):
     venue_data = {
         'id': venue.get('id'),
         'name': venue.get('fullName'),
+        'shortName': venue.get('name'),
         'city': venue.get('address', {}).get('city'),
         'state': venue.get('address', {}).get('state'),
+        'country': venue.get('address', {}).get('country'),
         'indoor': venue.get('indoor', False),
         'grass': venue.get('grass', True),
         'capacity': venue.get('capacity')
     }
     
-    # ========== ODDS DATA ==========
-    odds_data = {}
-    odds_list = competition.get('odds', [])
-    if odds_list:
-        odds = odds_list[0]
-        odds_data = {
-            'provider': odds.get('provider', {}).get('name'),
-            'spread': odds.get('spread'),
-            'spreadOdds': odds.get('spreadOdds'),
-            'overUnder': odds.get('overUnder'),
-            'overOdds': odds.get('overOdds'),
-            'underOdds': odds.get('underOdds'),
-            'homeMoneyLine': odds.get('homeTeamOdds', {}).get('moneyLine'),
-            'awayMoneyLine': odds.get('awayTeamOdds', {}).get('moneyLine'),
-            'details': odds.get('details')
-        }
+    # ========== ODDS DATA - Enhanced ==========
+    odds_data = extract_odds_data(competition.get('odds', []))
     
     # ========== WIN PROBABILITY (ESPN PREDICTOR) ==========
     predictor = {}
@@ -190,6 +310,17 @@ def extract_full_data(event_data, summary_data):
         for name in broadcast.get('names', []):
             broadcasts.append(name)
     
+    # Also capture geoBroadcasts for streaming info
+    geo_broadcasts = []
+    for gb in competition.get('geoBroadcasts', []):
+        geo_broadcasts.append({
+            'type': gb.get('type', {}).get('shortName'),
+            'market': gb.get('market', {}).get('type'),
+            'media': gb.get('media', {}).get('shortName'),
+            'lang': gb.get('lang'),
+            'region': gb.get('region')
+        })
+    
     # ========== GAME INFO ==========
     game_info = {}
     if summary_data and 'gameInfo' in summary_data:
@@ -213,13 +344,35 @@ def extract_full_data(event_data, summary_data):
             'athletesInvolved': [a.get('displayName') for a in lp.get('athletesInvolved', [])]
         }
     
+    # ========== TICKETS ==========
+    tickets = {}
+    tickets_list = competition.get('tickets', [])
+    if tickets_list:
+        t = tickets_list[0]
+        tickets = {
+            'summary': t.get('summary'),
+            'numberAvailable': t.get('numberAvailable'),
+            'link': t.get('links', [{}])[0].get('href') if t.get('links') else None
+        }
+    
+    # ========== LINKS ==========
+    links = {}
+    for link in event_data.get('links', []):
+        rel = link.get('rel', [])
+        if 'summary' in rel:
+            links['gamecast'] = link.get('href')
+        elif 'boxscore' in rel:
+            links['boxscore'] = link.get('href')
+        elif 'pbp' in rel:
+            links['playbyplay'] = link.get('href')
+    
     # ========== BUILD COMPLETE RECORD ==========
     full_data = {
         # Identifiers
         'game_id': game_id,
         'event_uid': event_data.get('uid'),
         'timestamp': datetime.utcnow().isoformat(),
-        'source': 'espn_lambda_full',
+        'source': 'espn_lambda_full_v2',
         
         # Game Status
         'status': {
@@ -264,15 +417,18 @@ def extract_full_data(event_data, summary_data):
         'defenders_in_box': 6,
         'number_of_pass_rushers': 4,
         
-        # Home Team
+        # Home Team - Full data
         'home_team': home_team.get('abbreviation'),
         'home_team_full': home_team,
         'home_score': home_team.get('score', 0),
         
-        # Away Team
+        # Away Team - Full data
         'away_team': away_team.get('abbreviation'),
         'away_team_full': away_team,
         'away_score': away_team.get('score', 0),
+        
+        # Game-level leaders (top performers across both teams)
+        'gameLeaders': game_leaders,
         
         # Weather
         'weather': weather_data,
@@ -280,7 +436,7 @@ def extract_full_data(event_data, summary_data):
         # Venue
         'venue': venue_data,
         
-        # Odds & Betting
+        # Odds & Betting - Enhanced
         'odds': odds_data,
         
         # ESPN Win Probability
@@ -289,6 +445,13 @@ def extract_full_data(event_data, summary_data):
         
         # Broadcasts
         'broadcasts': broadcasts,
+        'geoBroadcasts': geo_broadcasts,
+        
+        # Tickets
+        'tickets': tickets,
+        
+        # Links
+        'links': links,
         
         # Game Info
         'gameInfo': game_info,
@@ -303,7 +466,9 @@ def extract_full_data(event_data, summary_data):
             'date': event_data.get('date'),
             'week': event_data.get('week', {}).get('number'),
             'seasonType': event_data.get('season', {}).get('type'),
+            'seasonYear': event_data.get('season', {}).get('year'),
             'neutralSite': competition.get('neutralSite', False),
+            'conferenceCompetition': competition.get('conferenceCompetition', False),
             'attendance': competition.get('attendance')
         }
     }
@@ -325,7 +490,7 @@ def send_to_kinesis(data):
 
 def lambda_handler(event, context):
     """Main Lambda handler"""
-    print(f"ESPN Full Poller triggered at {datetime.utcnow().isoformat()}")
+    print(f"ESPN Full Poller v2 triggered at {datetime.utcnow().isoformat()}")
     
     scoreboard = get_scoreboard()
     if not scoreboard:
@@ -355,9 +520,11 @@ def lambda_handler(event, context):
             response = send_to_kinesis(full_data)
             if response:
                 plays_sent += 1
+                home_passing = full_data.get('home_team_full', {}).get('leaders', {}).get('passing', {})
                 print(f"Sent: {full_data['posteam']} vs {full_data['defteam']} - "
                       f"{full_data['down']}&{full_data['ydstogo']} at {full_data['yardline_100']} "
-                      f"| ESPN WP: {full_data.get('predictor', {}).get('homeWinProbability', 'N/A')}%")
+                      f"| ESPN WP: {full_data.get('predictor', {}).get('homeWinProbability', 'N/A')}% "
+                      f"| QB: {home_passing.get('shortName', 'N/A') if home_passing else 'N/A'}")
     
     result = {
         'statusCode': 200,
@@ -365,9 +532,18 @@ def lambda_handler(event, context):
             'live_games': live_games,
             'plays_sent': plays_sent,
             'timestamp': datetime.utcnow().isoformat(),
-            'data_captured': 'FULL'
+            'data_captured': 'FULL_V2',
+            'features': [
+                'headshots',
+                'receiving_leaders',
+                'full_stat_lines',
+                'enhanced_odds',
+                'home_away_records',
+                'tickets',
+                'geo_broadcasts'
+            ]
         })
     }
     
-    print(f"Done: {live_games} live games, {plays_sent} plays sent (FULL DATA)")
+    print(f"Done: {live_games} live games, {plays_sent} plays sent (FULL DATA V2)")
     return result
