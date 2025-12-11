@@ -14,8 +14,18 @@ import json
 import boto3
 from datetime import datetime
 from pathlib import Path
+# Add at top of file, after imports
+from threading import Lock
+
 
 app = FastAPI(title="NFL Real-Time Analytics API", version="4.3")
+
+# Global state for tracking Kinesis position
+kinesis_state = {
+    'last_sequence_number': None,
+    'shard_iterator': None,
+    'lock': Lock()
+}
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,8 +208,8 @@ async def kinesis_status():
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
-@app.get("/kinesis/fetch")
-async def fetch_kinesis():
+# @app.get("/kinesis/fetch")
+# async def fetch_kinesis():
     try:
         kinesis = boto3.client('kinesis', region_name='us-east-1')
         resp = kinesis.describe_stream(StreamName='nfl-play-stream')
@@ -300,6 +310,76 @@ async def fetch_kinesis():
         return {"status": "success", "source": "kinesis", "play_count": len(plays), "plays": plays}
     except Exception as e:
         return {"status": "error", "error": str(e), "plays": []}
+    
+@app.get("/kinesis/fetch") 
+async def fetch_kinesis():
+    """Fetch NEW records from Kinesis (tracks position)"""
+    try:
+        with kinesis_state['lock']:
+            kinesis = boto3.client('kinesis', region_name='us-east-1')
+            
+            # Get or create shard iterator
+            if not kinesis_state['shard_iterator']:
+                resp = kinesis.describe_stream(StreamName='nfl-play-stream')
+                shard_id = resp['StreamDescription']['Shards'][0]['ShardId']
+                
+                if kinesis_state['last_sequence_number']:
+                    # Resume from last position
+                    kinesis_state['shard_iterator'] = kinesis.get_shard_iterator(
+                        StreamName='nfl-play-stream',
+                        ShardId=shard_id,
+                        ShardIteratorType='AFTER_SEQUENCE_NUMBER',
+                        StartingSequenceNumber=kinesis_state['last_sequence_number']
+                    )['ShardIterator']
+                else:
+                    # First call - start from latest
+                    kinesis_state['shard_iterator'] = kinesis.get_shard_iterator(
+                        StreamName='nfl-play-stream',
+                        ShardId=shard_id,
+                        ShardIteratorType='LATEST'
+                    )['ShardIterator']
+            
+            # Fetch records
+            response = kinesis.get_records(
+                ShardIterator=kinesis_state['shard_iterator'], 
+                Limit=10
+            )
+            
+            records = response['Records']
+            kinesis_state['shard_iterator'] = response['NextShardIterator']
+            
+            # Update sequence number
+            if records:
+                kinesis_state['last_sequence_number'] = records[-1]['SequenceNumber']
+            
+            # Process records
+            plays = []
+            for rec in records:
+                raw = json.loads(rec['Data'].decode('utf-8'))
+                preds = get_predictions(raw)
+                play = {**raw, 'ml_predictions': preds, **preds}
+                plays.append(clean_data_for_json(play))
+            
+            return {
+                "status": "success", 
+                "source": "kinesis", 
+                "play_count": len(plays), 
+                "plays": plays,
+                "has_new_data": len(plays) > 0
+            }
+            
+    except Exception as e:
+        # Reset iterator on error
+        kinesis_state['shard_iterator'] = None
+        return {"status": "error", "error": str(e), "plays": []}
+
+
+@app.post("/kinesis/reset")
+async def reset_kinesis():
+    """Reset Kinesis position to start fresh"""
+    kinesis_state['last_sequence_number'] = None
+    kinesis_state['shard_iterator'] = None
+    return {"status": "reset", "message": "Will fetch from LATEST on next call"}
 
 @app.get("/kinesis/latest")
 async def fetch_latest():
