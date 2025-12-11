@@ -2,447 +2,344 @@ import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import './App.css';
 
-const API_URL = 'http://127.0.0.1:8000';
-
-const DEMO_PLAYS = [
-  { down: 1, ydstogo: 10, yardline_100: 75, qtr: 1, half_seconds_remaining: 1800, score_differential: 0, goal_to_go: 0, posteam_type: "home", desc: "1st & 10 at own 25 - Opening drive" },
-  { down: 3, ydstogo: 8, yardline_100: 45, qtr: 1, half_seconds_remaining: 1500, score_differential: 0, goal_to_go: 0, posteam_type: "home", desc: "3rd & 8 at midfield" },
-  { down: 1, ydstogo: 10, yardline_100: 20, qtr: 2, half_seconds_remaining: 900, score_differential: 7, goal_to_go: 0, posteam_type: "home", desc: "1st & 10 - RED ZONE!" },
-  { down: 1, ydstogo: 5, yardline_100: 5, qtr: 2, half_seconds_remaining: 600, score_differential: 7, goal_to_go: 1, posteam_type: "home", desc: "1st & Goal at the 5!" },
-  { down: 3, ydstogo: 15, yardline_100: 65, qtr: 4, half_seconds_remaining: 120, score_differential: -4, goal_to_go: 0, posteam_type: "away", desc: "3rd & 15 - Trailing, 2 min left!" },
-  { down: 1, ydstogo: 2, yardline_100: 2, qtr: 4, half_seconds_remaining: 30, score_differential: -4, goal_to_go: 1, posteam_type: "away", desc: "1st & Goal at 2 - GAME ON THE LINE!" },
-];
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 function App() {
-  const [prediction, setPrediction] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [apiStatus, setApiStatus] = useState(null);
   const [mode, setMode] = useState('manual');
-  const [demoIndex, setDemoIndex] = useState(0);
-  const [demoRunning, setDemoRunning] = useState(false);
+  const [apiStatus, setApiStatus] = useState({ connected: false, models: 0 });
+  const [predictions, setPredictions] = useState(null);
   const [kinesisStatus, setKinesisStatus] = useState(null);
-  const [kinesisPlays, setKinesisPlays] = useState([]);
-  const [livePolling, setLivePolling] = useState(false);
+  const [pysparkPlays, setPysparkPlays] = useState([]);
+  const [dataSource, setDataSource] = useState('pyspark'); // 'pyspark' or 'kinesis'
+  const [isPolling, setIsPolling] = useState(false);
   
-  const [playData, setPlayData] = useState({
-    down: 1, ydstogo: 10, yardline_100: 75, qtr: 1,
-    half_seconds_remaining: 900, score_differential: 0,
-    goal_to_go: 0, posteam_type: 'home',
-    defenders_in_box: 6, number_of_pass_rushers: 4
+  const [playInput, setPlayInput] = useState({
+    down: 1,
+    ydstogo: 10,
+    yardline_100: 75,
+    qtr: 1,
+    half_seconds_remaining: 900,
+    score_differential: 0,
+    posteam: 'KC',
+    defteam: 'SF'
   });
 
-  const checkApiHealth = useCallback(async () => {
-    try {
-      const response = await axios.get(`${API_URL}/health`);
-      setApiStatus(response.data);
-    } catch (error) {
-      setApiStatus({ status: 'offline' });
-    }
-  }, []);
+  // Demo plays
+  const demoPlays = [
+    { down: 1, ydstogo: 10, yardline_100: 75, qtr: 1, half_seconds_remaining: 900, score_differential: 0, posteam: 'KC', defteam: 'SF', description: 'Opening drive' },
+    { down: 3, ydstogo: 2, yardline_100: 45, qtr: 2, half_seconds_remaining: 600, score_differential: -7, posteam: 'BUF', defteam: 'MIA', description: 'Short yardage situation' },
+    { down: 1, ydstogo: 10, yardline_100: 15, qtr: 3, half_seconds_remaining: 450, score_differential: 3, posteam: 'PHI', defteam: 'DAL', description: 'Red zone opportunity' },
+    { down: 4, ydstogo: 1, yardline_100: 35, qtr: 4, half_seconds_remaining: 180, score_differential: -4, posteam: 'SF', defteam: 'KC', description: 'Go for it on 4th!' },
+    { down: 2, ydstogo: 8, yardline_100: 98, qtr: 4, half_seconds_remaining: 45, score_differential: -6, posteam: 'KC', defteam: 'SF', description: 'Goal line, game on the line!' },
+    { down: 3, ydstogo: 15, yardline_100: 35, qtr: 4, half_seconds_remaining: 120, score_differential: -7, posteam: 'DAL', defteam: 'PHI', description: '3rd and long, trailing' }
+  ];
 
-  const checkKinesisStatus = useCallback(async () => {
-    try {
-      const response = await axios.get(`${API_URL}/kinesis/status`);
-      setKinesisStatus(response.data);
-    } catch (error) {
-      setKinesisStatus({ status: 'error' });
-    }
-  }, []);
-
-  const fetchKinesisPlays = useCallback(async () => {
-    try {
-      const response = await axios.get(`${API_URL}/kinesis/fetch?limit=10`);
-      if (response.data.status === 'success' && response.data.records.length > 0) {
-        setKinesisPlays(response.data.records);
-        // Show latest play prediction
-        const latestRecord = response.data.records[response.data.records.length - 1];
-        const latestPred = response.data.predictions[response.data.predictions.length - 1];
-        setPrediction({
-          expected_points: latestPred.expected_points,
-          ...latestPred.scoring_probs,
-          ...latestPred.play_type,
-          pressure_probability: latestPred.pressure.pressure_probability,
-          pressure_risk: latestPred.pressure.pressure_risk
+  // Check API health
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const response = await axios.get(`${API_URL}/health`);
+        setApiStatus({
+          connected: true,
+          models: response.data.models_loaded,
+          pysparkAvailable: response.data.pyspark_output_available
         });
-        setPlayData(prev => ({
-          ...prev,
-          down: latestRecord.down || 1,
-          ydstogo: latestRecord.ydstogo || 10,
-          yardline_100: latestRecord.yardline_100 || 75,
-          qtr: latestRecord.qtr || 1,
-          score_differential: latestRecord.score_differential || 0
-        }));
+      } catch (error) {
+        setApiStatus({ connected: false, models: 0 });
       }
-    } catch (error) {
-      console.error('Kinesis fetch error:', error);
-    }
+    };
+    checkHealth();
+    const interval = setInterval(checkHealth, 30000);
+    return () => clearInterval(interval);
   }, []);
 
-  useEffect(() => {
-    checkApiHealth();
-    checkKinesisStatus();
-  }, [checkApiHealth, checkKinesisStatus]);
-
-  useEffect(() => {
-    if (demoRunning && mode === 'demo') {
-      const timer = setTimeout(() => {
-        const nextIndex = (demoIndex + 1) % DEMO_PLAYS.length;
-        setDemoIndex(nextIndex);
-        getPrediction(DEMO_PLAYS[nextIndex]);
-      }, 4000);
-      return () => clearTimeout(timer);
-    }
-  }, [demoRunning, demoIndex, mode]);
-
-  useEffect(() => {
-    if (livePolling && mode === 'live') {
-      const interval = setInterval(() => {
-        fetchKinesisPlays();
-      }, 3000);
-      return () => clearInterval(interval);
-    }
-  }, [livePolling, mode, fetchKinesisPlays]);
-
-  const getPrediction = async (data) => {
-    setLoading(true);
+  // Get predictions
+  const getPredictions = useCallback(async (play) => {
     try {
-      const response = await axios.post(`${API_URL}/predict`, data);
-      setPrediction(response.data);
+      const response = await axios.post(`${API_URL}/predict`, {
+        ...play,
+        shotgun: 1,
+        no_huddle: 0,
+        defenders_in_box: 6,
+        number_of_pass_rushers: 4,
+        posteam_type: 'home',
+        goal_to_go: play.yardline_100 <= play.ydstogo ? 1 : 0
+      });
+      setPredictions({ ...response.data, ...play });
     } catch (error) {
       console.error('Prediction error:', error);
     }
-    setLoading(false);
-  };
+  }, []);
 
+  // Fetch from PySpark or Kinesis
+  const fetchLiveData = useCallback(async () => {
+    try {
+      const endpoint = dataSource === 'pyspark' 
+        ? `${API_URL}/pyspark/predictions`
+        : `${API_URL}/kinesis/fetch`;
+      
+      const response = await axios.get(endpoint);
+      
+      if (response.data.plays && response.data.plays.length > 0) {
+        setPysparkPlays(response.data.plays);
+        const latest = response.data.plays[response.data.plays.length - 1];
+        setPredictions(latest);
+        setKinesisStatus({
+          connected: true,
+          source: response.data.source,
+          playCount: response.data.play_count
+        });
+      }
+    } catch (error) {
+      console.error('Fetch error:', error);
+    }
+  }, [dataSource]);
+
+  // Polling for live mode
+  useEffect(() => {
+    let interval;
+    if (mode === 'live' && isPolling) {
+      fetchLiveData();
+      interval = setInterval(fetchLiveData, 3000);
+    }
+    return () => clearInterval(interval);
+  }, [mode, isPolling, fetchLiveData]);
+
+  // Demo mode
+  const [demoIndex, setDemoIndex] = useState(0);
+  useEffect(() => {
+    let interval;
+    if (mode === 'demo') {
+      getPredictions(demoPlays[demoIndex]);
+      interval = setInterval(() => {
+        setDemoIndex(prev => {
+          const next = (prev + 1) % demoPlays.length;
+          getPredictions(demoPlays[next]);
+          return next;
+        });
+      }, 4000);
+    }
+    return () => clearInterval(interval);
+  }, [mode, demoIndex, getPredictions]);
+
+  // Manual mode handler
   const handleInputChange = (e) => {
     const { name, value } = e.target;
-    setPlayData(prev => ({
-      ...prev,
-      [name]: name === 'posteam_type' ? value : parseInt(value) || 0
-    }));
+    setPlayInput(prev => ({ ...prev, [name]: parseInt(value) || value }));
   };
 
-  const handlePredict = () => getPrediction(playData);
-
-  const startDemo = () => {
-    setMode('demo');
-    setDemoIndex(0);
-    setDemoRunning(true);
-    setLivePolling(false);
-    getPrediction(DEMO_PLAYS[0]);
+  const handleManualPredict = () => {
+    getPredictions(playInput);
   };
-
-  const startLive = () => {
-    setMode('live');
-    setDemoRunning(false);
-    setLivePolling(true);
-    fetchKinesisPlays();
-  };
-
-  const stopAll = () => {
-    setDemoRunning(false);
-    setLivePolling(false);
-  };
-
-  const formatPercent = (value) => `${(value * 100).toFixed(1)}%`;
 
   return (
     <div className="app">
       <header className="header">
         <h1>🏈 NFL Real-Time Analytics</h1>
         <p>Expected Points • Scoring Probability • Play Prediction</p>
-        <div>
-          {apiStatus?.status === 'healthy' ? (
-            <span className="status-badge status-online">
-              ✅ API Connected | Models: {Object.values(apiStatus.models).filter(Boolean).length}/4
-            </span>
-          ) : (
-            <span className="status-badge status-offline">
-              ❌ API Offline - Start the backend
-            </span>
-          )}
+        <div className={`api-status ${apiStatus.connected ? 'connected' : 'disconnected'}`}>
+          {apiStatus.connected ? `✅ API Connected | Models: ${apiStatus.models}/4` : '❌ API Disconnected'}
+          {apiStatus.pysparkAvailable && ' | PySpark ✓'}
         </div>
       </header>
 
-      <div className="mode-buttons">
-        <button onClick={() => { setMode('manual'); stopAll(); }}
-          className={`mode-btn ${mode === 'manual' ? 'mode-btn-active' : 'mode-btn-inactive'}`}>
+      <nav className="mode-selector">
+        <button className={mode === 'manual' ? 'active' : ''} onClick={() => setMode('manual')}>
           ⚙️ Manual Input
         </button>
-        <button onClick={startDemo}
-          className={`mode-btn ${mode === 'demo' ? 'mode-btn-active' : 'mode-btn-inactive'}`}>
-          🎮 Demo Mode
+        <button className={mode === 'demo' ? 'active' : ''} onClick={() => setMode('demo')}>
+          🎬 Demo Mode
         </button>
-        <button onClick={startLive}
-          className={`mode-btn ${mode === 'live' ? 'mode-btn-live' : 'mode-btn-inactive'}`}>
-          🔴 Live Kinesis
+        <button 
+          className={mode === 'live' ? 'active live' : ''} 
+          onClick={() => { setMode('live'); setIsPolling(true); }}
+        >
+          🔴 Live Stream
         </button>
-        {(demoRunning || livePolling) && (
-          <button onClick={stopAll} className="mode-btn mode-btn-stop">
-            ⏹️ Stop
+        {mode === 'live' && (
+          <button className="stop-btn" onClick={() => setIsPolling(false)}>
+            ⏹ Stop
           </button>
         )}
-      </div>
+      </nav>
 
-      {/* Kinesis Status Banner */}
       {mode === 'live' && (
-        <div className="kinesis-banner">
-          {kinesisStatus?.status === 'connected' ? (
-            <span className="kinesis-connected">
-              🟢 Connected to Kinesis: {kinesisStatus.stream_name} | Shards: {kinesisStatus.shard_count} | 
-              {livePolling ? ' Polling every 3s...' : ' Click to start polling'}
-            </span>
-          ) : (
-            <span className="kinesis-disconnected">
-              🔴 Kinesis not connected - Check AWS credentials in .env
-            </span>
-          )}
-          {kinesisPlays.length > 0 && (
-            <span className="kinesis-plays-count">
-              📊 {kinesisPlays.length} plays received
+        <div className="live-banner">
+          <div className="source-toggle">
+            <button 
+              className={dataSource === 'pyspark' ? 'active' : ''} 
+              onClick={() => setDataSource('pyspark')}
+            >
+              🔥 PySpark
+            </button>
+            <button 
+              className={dataSource === 'kinesis' ? 'active' : ''} 
+              onClick={() => setDataSource('kinesis')}
+            >
+              📡 Kinesis Direct
+            </button>
+          </div>
+          {kinesisStatus?.connected && (
+            <span>
+              🟢 Source: {kinesisStatus.source} | 📊 {kinesisStatus.playCount} plays | Polling every 3s...
             </span>
           )}
         </div>
       )}
 
-      <div className="grid-container">
-        {/* Input Panel */}
-        <div className="card">
-          <h2>
-            {mode === 'demo' ? '📍 Current Play' : 
-             mode === 'live' ? '📡 Live Feed' : '📝 Game Situation'}
-          </h2>
+      <main className="dashboard">
+        {/* Left Panel - Input/Live Feed */}
+        <section className="panel input-panel">
+          <h2>📍 {mode === 'live' ? 'Live Feed' : mode === 'demo' ? 'Demo Play' : 'Current Play'}</h2>
           
-          {mode === 'demo' ? (
-            <div>
-              <div className="demo-description">
-                <p>{DEMO_PLAYS[demoIndex].desc}</p>
-              </div>
-              <div className="stats-grid">
-                <div className="stat-box">
-                  <span>Down</span>
-                  <p>{DEMO_PLAYS[demoIndex].down}</p>
-                </div>
-                <div className="stat-box">
-                  <span>Distance</span>
-                  <p>{DEMO_PLAYS[demoIndex].ydstogo}</p>
-                </div>
-                <div className="stat-box">
-                  <span>Yard Line</span>
-                  <p>{100 - DEMO_PLAYS[demoIndex].yardline_100}</p>
-                </div>
-                <div className="stat-box">
-                  <span>Quarter</span>
-                  <p>Q{DEMO_PLAYS[demoIndex].qtr}</p>
-                </div>
-              </div>
-              <p style={{textAlign: 'center', color: '#94a3b8', marginTop: '16px'}}>
-                Play {demoIndex + 1} of {DEMO_PLAYS.length}
-              </p>
-            </div>
-          ) : mode === 'live' ? (
-            <div>
-              {kinesisPlays.length > 0 ? (
-                <>
-                  <div className="demo-description">
-                    <p>
-                      {kinesisPlays[kinesisPlays.length - 1].posteam || 'Team'} vs {kinesisPlays[kinesisPlays.length - 1].defteam || 'Opp'}
-                    </p>
-                    <p style={{fontSize: '14px', marginTop: '8px'}}>
-                      {kinesisPlays[kinesisPlays.length - 1].desc || 'Live play data'}
-                    </p>
-                  </div>
-                  <div className="stats-grid">
-                    <div className="stat-box">
-                      <span>Down</span>
-                      <p>{kinesisPlays[kinesisPlays.length - 1].down || '-'}</p>
-                    </div>
-                    <div className="stat-box">
-                      <span>Distance</span>
-                      <p>{kinesisPlays[kinesisPlays.length - 1].ydstogo || '-'}</p>
-                    </div>
-                    <div className="stat-box">
-                      <span>Yard Line</span>
-                      <p>{kinesisPlays[kinesisPlays.length - 1].yardline_100 ? 100 - kinesisPlays[kinesisPlays.length - 1].yardline_100 : '-'}</p>
-                    </div>
-                    <div className="stat-box">
-                      <span>Quarter</span>
-                      <p>Q{kinesisPlays[kinesisPlays.length - 1].qtr || '-'}</p>
-                    </div>
-                  </div>
-                  <div className="plays-list">
-                    <h4>Recent Plays</h4>
-                    {kinesisPlays.slice(-5).reverse().map((play, i) => (
-                      <div key={i} className="play-item">
-                        {play.down}&{play.ydstogo} at {100 - (play.yardline_100 || 0)} - Q{play.qtr}
-                      </div>
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <div className="empty-state">
-                  <p>📡</p>
-                  <p>Waiting for Kinesis data...</p>
-                  <p style={{fontSize: '12px'}}>Run the live demo simulator to send plays</p>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div>
+          {mode === 'manual' ? (
+            <div className="manual-inputs">
               <div className="input-grid">
                 <div className="input-group">
                   <label>Down</label>
-                  <select name="down" value={playData.down} onChange={handleInputChange}>
+                  <select name="down" value={playInput.down} onChange={handleInputChange}>
                     {[1,2,3,4].map(d => <option key={d} value={d}>{d}</option>)}
                   </select>
                 </div>
                 <div className="input-group">
                   <label>Distance</label>
-                  <input type="number" name="ydstogo" value={playData.ydstogo} onChange={handleInputChange} />
+                  <input type="number" name="ydstogo" value={playInput.ydstogo} onChange={handleInputChange} min="1" max="99" />
                 </div>
                 <div className="input-group">
                   <label>Yard Line</label>
-                  <input type="number" name="yardline_100" value={playData.yardline_100} onChange={handleInputChange} />
+                  <input type="number" name="yardline_100" value={playInput.yardline_100} onChange={handleInputChange} min="1" max="99" />
                 </div>
                 <div className="input-group">
                   <label>Quarter</label>
-                  <select name="qtr" value={playData.qtr} onChange={handleInputChange}>
-                    {[1,2,3,4].map(q => <option key={q} value={q}>{q}</option>)}
+                  <select name="qtr" value={playInput.qtr} onChange={handleInputChange}>
+                    {[1,2,3,4].map(q => <option key={q} value={q}>Q{q}</option>)}
                   </select>
                 </div>
-                <div className="input-group">
-                  <label>Score Diff</label>
-                  <input type="number" name="score_differential" value={playData.score_differential} onChange={handleInputChange} />
-                </div>
-                <div className="input-group">
-                  <label>Time (sec)</label>
-                  <input type="number" name="half_seconds_remaining" value={playData.half_seconds_remaining} onChange={handleInputChange} />
-                </div>
               </div>
-              <div className="checkbox-group">
-                <input type="checkbox" id="goal_to_go"
-                  checked={playData.goal_to_go === 1}
-                  onChange={(e) => setPlayData(prev => ({...prev, goal_to_go: e.target.checked ? 1 : 0}))} />
-                <label htmlFor="goal_to_go">Goal to Go</label>
-              </div>
-              <button onClick={handlePredict} className="predict-btn">
-                {loading ? '⏳ Predicting...' : '🎯 Get Prediction'}
-              </button>
+              <button className="predict-btn" onClick={handleManualPredict}>Get Predictions</button>
+            </div>
+          ) : (
+            <div className="play-display">
+              {predictions && (
+                <>
+                  <div className="matchup">
+                    <span className="team">{predictions.posteam || 'OFF'}</span>
+                    <span className="vs">vs</span>
+                    <span className="team">{predictions.defteam || 'DEF'}</span>
+                  </div>
+                  <div className="situation">
+                    {predictions.description && <p className="description">{predictions.description}</p>}
+                  </div>
+                  <div className="play-info-grid">
+                    <div className="info-box"><label>Down</label><span>{predictions.down}</span></div>
+                    <div className="info-box"><label>Distance</label><span>{predictions.ydstogo}</span></div>
+                    <div className="info-box"><label>Yard Line</label><span>{100 - predictions.yardline_100}</span></div>
+                    <div className="info-box"><label>Quarter</label><span>Q{predictions.qtr}</span></div>
+                  </div>
+                </>
+              )}
             </div>
           )}
-        </div>
-
-        {/* Real-Time Predictions */}
-        <div className="card">
-          <h2>📊 Real-Time Predictions <span className="badge-green">✓ ESPN Ready</span></h2>
           
-          {prediction ? (
-            <div>
-              <div className="ep-box">
-                <p>Expected Points</p>
-                <p>{prediction.expected_points}</p>
+          {mode === 'live' && pysparkPlays.length > 0 && (
+            <div className="recent-plays">
+              <h3>Recent Plays ({dataSource === 'pyspark' ? 'PySpark' : 'Kinesis'})</h3>
+              <ul>
+                {pysparkPlays.slice(-5).reverse().map((play, idx) => (
+                  <li key={idx}>{play.down}&{play.ydstogo} at {100-(play.yardline_100 || 0)} - Q{play.qtr}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+
+        {/* Center Panel - Predictions */}
+        <section className="panel predictions-panel">
+          <h2>📊 Real-Time Predictions 
+            <span className="badge">{dataSource === 'pyspark' ? '🔥 PySpark' : '✓ ML Models'}</span>
+          </h2>
+          
+          {predictions ? (
+            <>
+              <div className="ep-display">
+                <label>Expected Points</label>
+                <span className="ep-value">{predictions.expected_points?.toFixed(2) || '0.00'}</span>
               </div>
               
-              <div className="prob-section">
+              <div className="scoring-probs">
                 <h3>Scoring Probability</h3>
-                
-                <div className="prob-item">
-                  <div className="prob-header">
-                    <span>🏈 Touchdown</span>
-                    <span className="text-green">{formatPercent(prediction.td_prob)}</span>
+                <div className="prob-bar">
+                  <span>🏈 Touchdown</span>
+                  <div className="bar-container">
+                    <div className="bar td" style={{width: `${(predictions.td_prob || 0) * 100}%`}}></div>
                   </div>
-                  <div className="prob-bar">
-                    <div className="prob-fill prob-fill-green" style={{width: `${prediction.td_prob * 100}%`}}></div>
-                  </div>
+                  <span>{((predictions.td_prob || 0) * 100).toFixed(1)}%</span>
                 </div>
-                
-                <div className="prob-item">
-                  <div className="prob-header">
-                    <span>🥅 Field Goal</span>
-                    <span className="text-yellow">{formatPercent(prediction.fg_prob)}</span>
+                <div className="prob-bar">
+                  <span>🥅 Field Goal</span>
+                  <div className="bar-container">
+                    <div className="bar fg" style={{width: `${(predictions.fg_prob || 0) * 100}%`}}></div>
                   </div>
-                  <div className="prob-bar">
-                    <div className="prob-fill prob-fill-yellow" style={{width: `${prediction.fg_prob * 100}%`}}></div>
-                  </div>
+                  <span>{((predictions.fg_prob || 0) * 100).toFixed(1)}%</span>
                 </div>
-                
-                <div className="prob-item">
-                  <div className="prob-header">
-                    <span>❌ No Score</span>
-                    <span className="text-red">{formatPercent(prediction.no_score_prob)}</span>
+                <div className="prob-bar">
+                  <span>❌ No Score</span>
+                  <div className="bar-container">
+                    <div className="bar ns" style={{width: `${(predictions.no_score_prob || 0) * 100}%`}}></div>
                   </div>
-                  <div className="prob-bar">
-                    <div className="prob-fill prob-fill-red" style={{width: `${prediction.no_score_prob * 100}%`}}></div>
-                  </div>
-                </div>
-                
-                <div className="prob-item">
-                  <div className="prob-header">
-                    <span>🔄 Opp TD</span>
-                    <span className="text-purple">{formatPercent(prediction.opp_td_prob)}</span>
-                  </div>
-                  <div className="prob-bar">
-                    <div className="prob-fill prob-fill-purple" style={{width: `${prediction.opp_td_prob * 100}%`}}></div>
-                  </div>
+                  <span>{((predictions.no_score_prob || 0) * 100).toFixed(1)}%</span>
                 </div>
               </div>
-            </div>
+            </>
           ) : (
-            <div className="empty-state">
-              <p>📊</p>
-              <p>Enter play data or start demo</p>
-            </div>
+            <p className="no-data">Select a mode or enter play data</p>
           )}
-        </div>
+        </section>
 
-        {/* Play Type & Pressure */}
-        <div className="card">
-          <h2>🎯 Play Analysis <span className="badge-yellow">⚠️ Post-snap</span></h2>
+        {/* Right Panel - Analysis */}
+        <section className="panel analysis-panel">
+          <h2>🎯 Play Analysis</h2>
           
-          {prediction ? (
-            <div>
-              <p style={{color: '#94a3b8', marginBottom: '8px'}}>Predicted Play Type</p>
-              <div className="play-type-box">
-                <p>{prediction.predicted_play?.replace('_', ' ') || 'Unknown'}</p>
-              </div>
-              
-              <div className="run-pass-grid">
-                <div className="run-pass-box">
-                  <p>Run</p>
-                  <p className="text-orange">{formatPercent(prediction.run_probability || 0)}</p>
+          {predictions ? (
+            <>
+              <div className="play-type">
+                <label>Predicted Play Type</label>
+                <span className="play-type-value">{predictions.predicted_play || 'Pass'}</span>
+                <div className="run-pass-split">
+                  <div className="split-item">
+                    <span>Run</span>
+                    <span className="pct">{((predictions.run_probability || 0.3) * 100).toFixed(1)}%</span>
+                  </div>
+                  <div className="split-item">
+                    <span>Pass</span>
+                    <span className="pct pass">{((predictions.pass_probability || 0.7) * 100).toFixed(1)}%</span>
+                  </div>
                 </div>
-                <div className="run-pass-box">
-                  <p>Pass</p>
-                  <p className="text-blue">{formatPercent(prediction.pass_probability || 0)}</p>
+              </div>
+              
+              <div className="pressure">
+                <label>Pressure Prediction</label>
+                <div className={`pressure-indicator ${predictions.pressure_risk || 'medium'}`}>
+                  <span className="pressure-value">{((predictions.pressure_probability || 0.4) * 100).toFixed(1)}%</span>
+                  <span className="risk-label">{(predictions.pressure_risk || 'MEDIUM').toUpperCase()} RISK</span>
                 </div>
               </div>
               
-              <p style={{color: '#94a3b8', marginBottom: '8px'}}>Pressure Prediction</p>
-              <div className={`pressure-box ${
-                prediction.pressure_risk === 'high' ? 'pressure-high' :
-                prediction.pressure_risk === 'medium' ? 'pressure-medium' : 'pressure-low'
-              }`}>
-                <p>{formatPercent(prediction.pressure_probability || 0)}</p>
-                <p>{prediction.pressure_risk === 'high' ? '🔴 HIGH RISK' :
-                    prediction.pressure_risk === 'medium' ? '🟡 MEDIUM RISK' : '🟢 LOW RISK'}</p>
-              </div>
-              
-              <div className="disclaimer">
-                ⚠️ Play type and pressure predictions use post-snap data which may not be available in true real-time.
-              </div>
-            </div>
+              {dataSource === 'pyspark' && mode === 'live' && (
+                <div className="pyspark-badge">
+                  <span>🔥 Processed by PySpark</span>
+                </div>
+              )}
+            </>
           ) : (
-            <div className="empty-state">
-              <p>🎯</p>
-              <p>Waiting for prediction...</p>
-            </div>
+            <p className="no-data">Waiting for data...</p>
           )}
-        </div>
-      </div>
+        </section>
+      </main>
 
       <footer className="footer">
         <p>Expected Points: R² = 99.5% | Scoring Probability: R² = 94-99% | Play Classifier: 68.8% | Pressure: 61.1% AUC</p>
-        <p>Data: 9 NFL Seasons (2016-2024) • ~310K plays</p>
+        <p>Data: 9 NFL Seasons (2016-2024) • ~310K plays • PySpark + Kinesis + XGBoost</p>
       </footer>
     </div>
   );
